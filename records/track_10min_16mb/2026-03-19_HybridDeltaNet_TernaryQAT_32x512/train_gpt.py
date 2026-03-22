@@ -1,6 +1,7 @@
 """
-Hybrid GLA (Gated Linear Attention) + Full Attention with Ternary QAT
-Architecture: 12 layers (9 GLA + 3 full attention), 512 dim, 8 heads
+Hybrid GLA (Gated Linear Attention) + Full Attention with Ternary QAT + Depth Recurrence
+Architecture: 12 unique layers (9 GLA + 3 full attention) with inner-loop recurrence
+  - 2 entry layers + 8 recurrent layers (×N) + 2 exit layers = 20+ effective layers
 Compression: Ternary QAT for weight matrices, int8 for embedding, fp32 for control tensors
 """
 
@@ -43,11 +44,12 @@ class Hyperparameters:
     seed = int(os.environ.get("SEED", 1337))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
+    val_stride = int(os.environ.get("VAL_STRIDE", 64))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
@@ -58,7 +60,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = int(os.environ.get("MLP_MULT", 3))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
@@ -69,7 +71,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
-    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
+    muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.99))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(
         os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85)
@@ -78,10 +80,14 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
 
     chunk_size = int(os.environ.get("CHUNK_SIZE", 64))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
+    num_recurrences = int(os.environ.get("NUM_RECURRENCES", 2))
+    num_entry_layers = int(os.environ.get("NUM_ENTRY_LAYERS", 2))
+    num_exit_layers = int(os.environ.get("NUM_EXIT_LAYERS", 2))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
 
 
 # -----------------------------
@@ -113,11 +119,13 @@ class Muon(torch.optim.Optimizer):
         momentum: float,
         backend_steps: int,
         nesterov: bool = True,
+        weight_decay: float = 0.0,
     ):
         super().__init__(
             params,
             dict(
-                lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov
+                lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov,
+                weight_decay=weight_decay,
             ),
         )
 
@@ -165,8 +173,11 @@ class Muon(torch.optim.Optimizer):
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
+            wd = group.get("weight_decay", 0.0)
             curr = 0
             for p in params:
+                if wd > 0:
+                    p.mul_(1.0 - lr * wd)
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
@@ -229,35 +240,64 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
+    # Sliding window evaluation: each window is train_seq_len tokens of context,
+    # but only the last val_stride tokens contribute to the loss / BPB metric.
+    # This gives every evaluated position at least (seq_len - stride) tokens of
+    # left context, reducing the "cold start" penalty of non-overlapping chunks.
+    seq_len = args.train_seq_len
+    stride = min(args.val_stride, seq_len)
+    if stride <= 0:
+        stride = seq_len
+
+    total_tokens = val_tokens.numel() - 1
+    num_windows = max(1, (total_tokens - seq_len) // stride + 1)
+
+    # Distribute windows evenly across ranks
+    win_start = (num_windows * rank) // world_size
+    win_end = (num_windows * (rank + 1)) // world_size
+
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
-        raise ValueError("VAL_BATCH_SIZE too small")
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    batch_size = max(1, local_batch_tokens // seq_len)
+
+    # Offsets [0 .. seq_len] used to gather each window (input + 1 target token)
+    offsets = torch.arange(seq_len + 1)
+
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(
-                device=device, dtype=torch.int64, non_blocking=True
-            )
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+        for b_start in range(win_start, win_end, batch_size):
+            b_end = min(b_start + batch_size, win_end)
+            actual_batch = b_end - b_start
+
+            # Gather overlapping windows via vectorised indexing on CPU
+            starts = torch.arange(b_start, b_end) * stride  # [actual_batch]
+            indices = starts[:, None] + offsets[None, :]     # [actual_batch, seq_len+1]
+            tokens = val_tokens[indices]                     # CPU, uint16
+            x = tokens[:, :-1].to(device=device, dtype=torch.int64, non_blocking=True)
+            y = tokens[:, 1:].to(device=device, dtype=torch.int64, non_blocking=True)
+
+            # Forward pass on full context to get logits
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
+                logits = model(x, None).detach()  # [actual_batch, seq_len, vocab]
+
+            # Only score the last `stride` positions
+            logits_s = logits[:, -stride:, :].contiguous()
+            y_s = y[:, -stride:].contiguous()
+            per_token_loss = F.cross_entropy(
+                logits_s.reshape(-1, logits_s.size(-1)),
+                y_s.reshape(-1),
+                reduction="none",
+            )
+
+            val_loss_sum += per_token_loss.to(torch.float64).sum()
+            val_token_count += float(actual_batch * stride)
+
+            # Byte counting for BPB (stride portion only)
+            prev_ids = x[:, -stride:].reshape(-1)
+            tgt_ids = y_s.reshape(-1)
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (
                 has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
@@ -601,20 +641,35 @@ class HybridGPT(nn.Module):
         logit_softcap: float,
         tied_embed_init_std: float,
         qk_gain_init: float,
+        num_recurrences: int = 2,
+        num_entry_layers: int = 2,
+        num_exit_layers: int = 2,
     ):
         super().__init__()
         self.logit_softcap = logit_softcap
         self.tied_embed_init_std = tied_embed_init_std
+        self.num_recurrences = num_recurrences
+        self.num_entry_layers = num_entry_layers
+        self.num_exit_layers = num_exit_layers
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
 
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        # Recurrent block: layers between entry and exit
+        num_recurrent_layers = num_layers - num_entry_layers - num_exit_layers
+        self.num_recurrent_layers = num_recurrent_layers
+        # U-Net skip connections within the recurrent block
+        rec_encoder = num_recurrent_layers // 2
+        rec_decoder = num_recurrent_layers - rec_encoder
+        self.rec_encoder_count = rec_encoder
+        self.rec_decoder_count = rec_decoder
+        self.num_skip_weights = min(rec_encoder, rec_decoder)
         self.skip_weights = nn.Parameter(
             torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32)
         )
+
+        # RMSNorm applied between recurrence passes for gradient stability
+        self.recurrence_norm = RMSNorm()
 
         self.blocks = nn.ModuleList()
         for i in range(num_layers):
@@ -634,30 +689,52 @@ class HybridGPT(nn.Module):
 
         self.final_norm = RMSNorm()
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(
+        self, input_ids: Tensor, target_ids: Tensor | None = None
+    ) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
 
-        # Encoder half: accumulate skip connections
-        skip_connections: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skip_connections.append(x)
+        entry_end = self.num_entry_layers
+        rec_start = entry_end
+        rec_end = rec_start + self.num_recurrent_layers
+        exit_start = rec_end
 
-        # Decoder half: consume skip connections in reverse
-        for i in range(self.num_decoder_layers):
-            block_idx = self.num_encoder_layers + i
-            if i < self.num_skip_weights:
-                skip = skip_connections[self.num_skip_weights - 1 - i]
-                sw = self.skip_weights[i].to(dtype=x.dtype)[None, None, :]
-                x = x + sw * skip
-            x = self.blocks[block_idx](x, x0)
+        # Entry layers (unique, run once)
+        for i in range(entry_end):
+            x = self.blocks[i](x, x0)
+
+        # Recurrent layers (run num_recurrences times)
+        for r in range(self.num_recurrences):
+            if r > 0:
+                x = self.recurrence_norm(x)
+
+            # Encoder half of recurrent block: save skip connections
+            skip_connections: list[Tensor] = []
+            for i in range(self.rec_encoder_count):
+                x = self.blocks[rec_start + i](x, x0)
+                skip_connections.append(x)
+
+            # Decoder half of recurrent block: consume skip connections
+            for j in range(self.rec_decoder_count):
+                block_idx = rec_start + self.rec_encoder_count + j
+                if j < self.num_skip_weights:
+                    skip = skip_connections[self.num_skip_weights - 1 - j]
+                    sw = self.skip_weights[j].to(dtype=x.dtype)[None, None, :]
+                    x = x + sw * skip
+                x = self.blocks[block_idx](x, x0)
+
+        # Exit layers (unique, run once)
+        for i in range(exit_start, len(self.blocks)):
+            x = self.blocks[i](x, x0)
 
         x = self.final_norm(x)
         logits = F.linear(x, self.tok_emb.weight)
         logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
 
+        if target_ids is None:
+            return logits
         return F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1))
 
 
@@ -958,6 +1035,9 @@ def main() -> None:
             logit_softcap=args.logit_softcap,
             tied_embed_init_std=args.tied_embed_init_std,
             qk_gain_init=args.qk_gain_init,
+            num_recurrences=args.num_recurrences,
+            num_entry_layers=args.num_entry_layers,
+            num_exit_layers=args.num_exit_layers,
         )
         .to(device)
         .bfloat16()
@@ -1009,6 +1089,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_weight_decay,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1025,11 +1106,13 @@ def main() -> None:
     attn_layers = args.num_layers // 4
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    effective_depth = args.num_entry_layers + base_model.num_recurrent_layers * args.num_recurrences + args.num_exit_layers
     log0(
         f"architecture:hybrid_gla num_layers:{args.num_layers} "
         f"gla_layers:{gla_layers} attention_layers:{attn_layers} "
-        f"encoder_layers:{base_model.num_encoder_layers} "
-        f"decoder_layers:{base_model.num_decoder_layers}"
+        f"entry_layers:{args.num_entry_layers} recurrent_layers:{base_model.num_recurrent_layers} "
+        f"exit_layers:{args.num_exit_layers} num_recurrences:{args.num_recurrences} "
+        f"effective_depth:{effective_depth}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len}"
