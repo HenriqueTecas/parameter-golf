@@ -88,6 +88,7 @@ class Hyperparameters:
     num_entry_layers = int(os.environ.get("NUM_ENTRY_LAYERS", 2))
     num_exit_layers = int(os.environ.get("NUM_EXIT_LAYERS", 2))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 3))
 
 
 # -----------------------------
@@ -518,6 +519,20 @@ class GQASelfAttention(nn.Module):
             torch.full((num_heads,), qk_gain_init, dtype=torch.float32)
         )
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.use_xsa = False  # Enabled selectively on deeper layers
+
+    def _xsa(self, y: Tensor, v: Tensor) -> Tensor:
+        """Exclusive Self Attention: subtract self-value projection (GQA-aware, zero-alloc).
+        y: [B, H, T, D], v: [B, Hkv, T, D]."""
+        B, H, T, D = y.shape
+        Hkv = v.size(1)
+        group = H // Hkv
+        # Reshape y into KV head groups — free view, no memory alloc
+        y_g = y.reshape(B, Hkv, group, T, D)
+        vn = F.normalize(v, dim=-1).unsqueeze(2)  # [B, Hkv, 1, T, D]
+        # Project out self-value component per KV head group
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(B, H, T, D)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -555,6 +570,8 @@ class GQASelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        if self.use_xsa:
+            y = self._xsa(y, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.out_proj(y)
 
@@ -1042,6 +1059,13 @@ def main() -> None:
         .to(device)
         .bfloat16()
     )
+
+    # Enable XSA on the last N attention layers
+    if args.xsa_last_n > 0:
+        attn_blocks = [b for b in base_model.blocks if isinstance(b.mixer, GQASelfAttention)]
+        for b in attn_blocks[-args.xsa_last_n:]:
+            b.mixer.use_xsa = True
+        log0(f"xsa:enabled on last {min(args.xsa_last_n, len(attn_blocks))} of {len(attn_blocks)} attention layers")
 
     # Keep QATLinear weights in fp32 for gradient quality
     for module in base_model.modules():
