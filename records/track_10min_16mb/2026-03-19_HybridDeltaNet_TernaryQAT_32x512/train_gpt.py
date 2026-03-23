@@ -242,6 +242,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    num_recurrences: int | None = None,
 ) -> tuple[float, float]:
     # Sliding window evaluation: each window is train_seq_len tokens of context,
     # but only the last val_stride tokens contribute to the loss / BPB metric.
@@ -282,7 +283,7 @@ def eval_val(
 
             # Forward pass on full context to get logits
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = model(x, None).detach()  # [actual_batch, seq_len, vocab]
+                logits = model(x, None, num_recurrences=num_recurrences).detach()  # [actual_batch, seq_len, vocab]
 
             # Only score the last `stride` positions
             logits_s = logits[:, -stride:, :].contiguous()
@@ -406,6 +407,8 @@ class QATLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if self.apply_qat and QATLinear.qat_globally_enabled:
+            # SOTA Feb 2026: Zero-Centered QAT to prevent sparsity collapse
+            x = x - x.mean(dim=-1, keepdim=True)
             # During QAT (training or eval), always use the quantized weights.
             # TernaryQuantizeSTE.apply performs the "compress-uncompress" cycle.
             w_q = TernaryQuantizeSTE.apply(self.weight)
@@ -820,7 +823,7 @@ class HybridGPT(nn.Module):
         self.final_norm = RMSNorm()
 
     def forward(
-        self, input_ids: Tensor, target_ids: Tensor | None = None
+        self, input_ids: Tensor, target_ids: Tensor | None = None, num_recurrences: int | None = None
     ) -> Tensor:
         x = self.tok_emb(input_ids)
         
@@ -849,8 +852,9 @@ class HybridGPT(nn.Module):
             x, v = self.blocks[i](x, x0, v_base)
             if v_base is None: v_base = v
 
-        # Recurrent layers (run num_recurrences times)
-        for r in range(self.num_recurrences):
+        # Recurrent layers (run dynamic or static count)
+        r_count = num_recurrences if num_recurrences is not None else self.num_recurrences
+        for r in range(r_count):
             if r > 0:
                 x = self.recurrence_norm(x)
 
@@ -1315,19 +1319,21 @@ def main() -> None:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return (
-                max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0)
-                if warmdown_start <= step < args.iterations
-                else 1.0
-            )
+            if step < warmdown_start:
+                return 1.0
+            # SOTA March 2026: Late Cosine decay
+            progress = (step - warmdown_start) / args.warmdown_iters
+            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+        
         step_ms = elapsed_ms / max(step, 1)
         warmdown_ms = args.warmdown_iters * step_ms
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return (
-            remaining_ms / max(warmdown_ms, 1e-9)
-            if remaining_ms <= warmdown_ms
-            else 1.0
-        )
+        
+        if remaining_ms > warmdown_ms:
+            return 1.0
+        # SOTA March 2026: Late Cosine decay
+        progress = 1.0 - (remaining_ms / max(warmdown_ms, 1e-9))
+        return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
     if args.warmup_steps > 0:
         initial_model_state = {
@@ -1387,6 +1393,18 @@ def main() -> None:
             stop_after_step is not None and step >= stop_after_step
         )
 
+        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        progress = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
+        
+        # SOTA 2026: Elastic Recurrence switch (recurrence 1 -> 2)
+        # SOTA 2026: Late QAT switch (FP32 -> Ternary)
+        was_enabled = QATLinear.qat_globally_enabled
+        QATLinear.qat_globally_enabled = progress >= (1.0 - args.late_qat_frac)
+        current_recurrence = 2 if QATLinear.qat_globally_enabled else 1
+        
+        if QATLinear.qat_globally_enabled and not was_enabled:
+            log0(f"late_qat: enabling ternary QAT and switching to recurrence=2 at step {step} (progress={progress:.3f})")
+
         should_validate = last_step or (
             args.val_loss_every > 0 and step % args.val_loss_every == 0
         )
@@ -1404,10 +1422,12 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                num_recurrences=current_recurrence,
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms "
+                f"rec:{current_recurrence}"
             )
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -1421,14 +1441,6 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-
-        # Late QAT: train full precision early, enable ternary STE when LR starts decaying
-        if args.late_qat_frac > 0:
-            progress = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
-            was_enabled = QATLinear.qat_globally_enabled
-            QATLinear.qat_globally_enabled = progress >= (1.0 - args.late_qat_frac)
-            if QATLinear.qat_globally_enabled and not was_enabled:
-                log0(f"late_qat: enabling ternary QAT at step {step} (progress={progress:.3f})")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1438,7 +1450,8 @@ def main() -> None:
                 args.train_batch_tokens, args.train_seq_len, grad_accum_steps
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
+                # SOTA 2026: Pass dynamic recurrence count
+                loss = model(x, y, num_recurrences=current_recurrence)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
