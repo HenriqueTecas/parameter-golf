@@ -631,17 +631,18 @@ class GQASelfAttention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        # Expand KV heads for GQA compat
-        if self.num_kv_heads != self.num_heads:
-            group = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(group, dim=1)
-            v = v.repeat_interleave(group, dim=1)
-
         if self.use_diag_mask:
+            # Expand KV heads manually (Flash/mem_efficient don't support mask+GQA)
+            if self.num_kv_heads != self.num_heads:
+                group = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(group, dim=1)
+                v_attn = v.repeat_interleave(group, dim=1)
+            else:
+                v_attn = v
             y = F.scaled_dot_product_attention(
                 q,
                 k,
-                v,
+                v_attn,
                 attn_mask=self.diag_mask,
                 is_causal=False,
             )
@@ -652,6 +653,7 @@ class GQASelfAttention(nn.Module):
                 v,
                 attn_mask=None,
                 is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         if self.use_xsa:
             y = self._xsa(y, v)
