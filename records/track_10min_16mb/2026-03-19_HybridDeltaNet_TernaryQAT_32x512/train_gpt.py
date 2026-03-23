@@ -1117,7 +1117,8 @@ def main() -> None:
             ) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    use_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
     model: nn.Module = (
         DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
         if distributed
