@@ -578,13 +578,17 @@ class GQASelfAttention(nn.Module):
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
         if self.use_diag_mask:
+            # Expand KV heads for GQA compat (Flash/mem_efficient don't support mask+GQA)
+            if self.num_kv_heads != self.num_heads:
+                group = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(group, dim=1)
+                v = v.repeat_interleave(group, dim=1)
             y = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
                 attn_mask=self.diag_mask,
                 is_causal=False,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         else:
             y = F.scaled_dot_product_attention(
@@ -1008,7 +1012,7 @@ def main() -> None:
 
     enable_cudnn_sdp(False)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
+    enable_mem_efficient_sdp(True)  # Needed for diagonal mask (flash doesn't support attn_mask)
     enable_math_sdp(False)
 
     logfile = None
