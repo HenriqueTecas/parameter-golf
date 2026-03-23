@@ -614,6 +614,9 @@ class GQASelfAttention(nn.Module):
             # ResFormer style Value Residual: blend first layer's V into current
             mix = torch.sigmoid(self.v_resid_mix).to(v.dtype)
             v = (1.0 - mix) * v + mix * v_base
+        else:
+            # Tie unused parameter to the compute graph for DDP without performance penalty
+            v = v + 0.0 * self.v_resid_mix.to(v.dtype)
 
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
@@ -1231,7 +1234,6 @@ def main() -> None:
             compiled_model,
             device_ids=[local_rank],
             broadcast_buffers=False,
-            find_unused_parameters=True,
         )
         if distributed
         else compiled_model
