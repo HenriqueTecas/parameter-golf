@@ -405,7 +405,9 @@ class QATLinear(nn.Module):
         self._zero_init = zero_init
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.apply_qat and self.training and QATLinear.qat_globally_enabled:
+        if self.apply_qat and QATLinear.qat_globally_enabled:
+            # During QAT (training or eval), always use the quantized weights.
+            # TernaryQuantizeSTE.apply performs the "compress-uncompress" cycle.
             w_q = TernaryQuantizeSTE.apply(self.weight)
             return F.linear(x, w_q.to(x.dtype), None)
         return F.linear(x, self.weight.to(x.dtype), None)
