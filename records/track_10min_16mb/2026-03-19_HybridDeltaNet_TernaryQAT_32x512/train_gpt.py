@@ -850,33 +850,28 @@ class HybridGPT(nn.Module):
             x, v = self.blocks[i](x, x0, v_base)
             if v_base is None: v_base = v
 
-        @torch.compiler.disable()
-        def _run_recurrence(x: Tensor, x0: Tensor, v_base: Tensor | None, r_count: int) -> tuple[Tensor, Tensor | None]:
-            for r in range(r_count):
-                if r > 0:
-                    x = self.recurrence_norm(x)
-
-                # Encoder half of recurrent block: save skip connections
-                skip_connections: list[Tensor] = []
-                for i in range(self.rec_encoder_count):
-                    x, v = self.blocks[rec_start + i](x, x0, v_base)
-                    if v_base is None: v_base = v
-                    skip_connections.append(x)
-
-                # Decoder half of recurrent block: consume skip connections
-                for j in range(self.rec_decoder_count):
-                    block_idx = rec_start + self.rec_encoder_count + j
-                    if j < self.num_skip_weights:
-                        skip = skip_connections[self.num_skip_weights - 1 - j]
-                        sw = self.skip_weights[j].to(dtype=x.dtype)[None, None, :]
-                        x = x + sw * skip
-                    x, v = self.blocks[block_idx](x, x0, v_base)
-                    if v_base is None: v_base = v
-            return x, v_base
-
         # Recurrent layers (run dynamic or static count)
         r_count = num_recurrences if num_recurrences is not None else self.num_recurrences
-        x, v_base = _run_recurrence(x, x0, v_base, r_count)
+        for r in range(r_count):
+            if r > 0:
+                x = self.recurrence_norm(x)
+
+            # Encoder half of recurrent block: save skip connections
+            skip_connections: list[Tensor] = []
+            for i in range(self.rec_encoder_count):
+                x, v = self.blocks[rec_start + i](x, x0, v_base)
+                if v_base is None: v_base = v
+                skip_connections.append(x)
+
+            # Decoder half of recurrent block: consume skip connections
+            for j in range(self.rec_decoder_count):
+                block_idx = rec_start + self.rec_encoder_count + j
+                if j < self.num_skip_weights:
+                    skip = skip_connections[self.num_skip_weights - 1 - j]
+                    sw = self.skip_weights[j].to(dtype=x.dtype)[None, None, :]
+                    x = x + sw * skip
+                x, v = self.blocks[block_idx](x, x0, v_base)
+                if v_base is None: v_base = v
 
         # Exit layers (unique, run once)
         for i in range(exit_start, len(self.blocks)):
@@ -1235,7 +1230,19 @@ def main() -> None:
                 param.data = param.data.float()
 
     use_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
+    if use_compile:
+        # SOTA March 2026: Compile sub-modules instead of the whole model to allow
+        # the dynamic recurrence loop to run in Python without Inductor OOM or Dynamo errors.
+        for block in base_model.blocks:
+            # We must use fullgraph=False here because the blocks contain mixer/mlp logic
+            # that Inductor might want to partition or graph-break.
+            torch.compile(block, dynamic=False, fullgraph=True)
+        torch.compile(base_model.bigram_hash, dynamic=False, fullgraph=True)
+        torch.compile(base_model.tok_emb, dynamic=False, fullgraph=True)
+        torch.compile(base_model.recurrence_norm, dynamic=False, fullgraph=True)
+        torch.compile(base_model.final_norm, dynamic=False, fullgraph=True)
+
+    compiled_model = base_model
     model: nn.Module = (
         DDP(
             compiled_model,
@@ -1406,7 +1413,6 @@ def main() -> None:
         current_recurrence = 2 if QATLinear.qat_globally_enabled else 1
         
         if QATLinear.qat_globally_enabled and not was_enabled:
-            torch._dynamo.reset() # SOTA March 2026: Clear graph for new depth
             log0(f"late_qat: enabling ternary QAT and switching to recurrence=2 at step {step} (progress={progress:.3f})")
 
         should_validate = last_step or (
