@@ -80,15 +80,16 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.3))
+    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 1.0))
 
     chunk_size = int(os.environ.get("CHUNK_SIZE", 64))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
     num_recurrences = int(os.environ.get("NUM_RECURRENCES", 2))
     num_entry_layers = int(os.environ.get("NUM_ENTRY_LAYERS", 2))
     num_exit_layers = int(os.environ.get("NUM_EXIT_LAYERS", 2))
-    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.04))
-    xsa_last_n = int(os.environ.get("XSA_LAST_N", 3))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
+    late_qat_frac = float(os.environ.get("LATE_QAT_FRAC", 0.0))
 
 
 # -----------------------------
@@ -260,8 +261,8 @@ def eval_val(
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     batch_size = max(1, local_batch_tokens // seq_len)
 
-    # Offsets [0 .. seq_len] used to gather each window (input + 1 target token)
-    offsets = torch.arange(seq_len + 1)
+    # Create an O(1) strided view of overlapping windows to avoid heavy CPU indexing
+    windows = val_tokens.unfold(0, seq_len + 1, stride)
 
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
@@ -273,10 +274,8 @@ def eval_val(
             b_end = min(b_start + batch_size, win_end)
             actual_batch = b_end - b_start
 
-            # Gather overlapping windows via vectorised indexing on CPU
-            starts = torch.arange(b_start, b_end) * stride  # [actual_batch]
-            indices = starts[:, None] + offsets[None, :]     # [actual_batch, seq_len+1]
-            tokens = val_tokens[indices]                     # CPU, uint16
+            # Fast basic slicing from the strided view
+            tokens = windows[b_start:b_end]                  # CPU, uint16, fast view
             x = tokens[:, :-1].to(device=device, dtype=torch.int64, non_blocking=True)
             y = tokens[:, 1:].to(device=device, dtype=torch.int64, non_blocking=True)
 
@@ -326,6 +325,8 @@ class TernaryQuantizeSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, weight: Tensor) -> Tensor:
         scale = weight.abs().mean().clamp(min=1e-5)
+        # fp16 scale simulation: match serialization precision to minimize roundtrip gap
+        scale = scale.half().float()
         threshold = 0.5 * scale
         w_ternary = torch.where(
             weight > threshold,
@@ -343,6 +344,9 @@ class TernaryQuantizeSTE(torch.autograd.Function):
 
 
 class QATLinear(nn.Module):
+    # Global toggle for late QAT: when False, all QATLinear layers use fp32 weights
+    qat_globally_enabled: bool = True
+
     def __init__(
         self,
         in_features: int,
@@ -361,7 +365,7 @@ class QATLinear(nn.Module):
         self._zero_init = zero_init
 
     def forward(self, x: Tensor) -> Tensor:
-        if self.apply_qat and self.training:
+        if self.apply_qat and self.training and QATLinear.qat_globally_enabled:
             w_q = TernaryQuantizeSTE.apply(self.weight)
             return F.linear(x, w_q.to(x.dtype), None)
         return F.linear(x, self.weight.to(x.dtype), None)
@@ -1218,6 +1222,10 @@ def main() -> None:
             args.train_files, rank, world_size, device
         )
 
+    # Late QAT: start with QAT disabled if late_qat_frac > 0
+    if args.late_qat_frac > 0:
+        QATLinear.qat_globally_enabled = False
+
     training_time_ms = 0.0
     stop_after_step: int | None = None
     torch.cuda.synchronize()
@@ -1263,6 +1271,14 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # Late QAT: train full precision early, enable ternary STE when LR starts decaying
+        if args.late_qat_frac > 0:
+            progress = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
+            was_enabled = QATLinear.qat_globally_enabled
+            QATLinear.qat_globally_enabled = progress >= (1.0 - args.late_qat_frac)
+            if QATLinear.qat_globally_enabled and not was_enabled:
+                log0(f"late_qat: enabling ternary QAT at step {step} (progress={progress:.3f})")
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
