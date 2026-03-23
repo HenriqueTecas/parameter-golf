@@ -89,6 +89,7 @@ class Hyperparameters:
     num_exit_layers = int(os.environ.get("NUM_EXIT_LAYERS", 2))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
+    diag_mask_last_n = int(os.environ.get("DIAG_MASK_LAST_N", 0))
     late_qat_frac = float(os.environ.get("LATE_QAT_FRAC", 0.0))
 
 
@@ -524,6 +525,16 @@ class GQASelfAttention(nn.Module):
         )
         self.rotary = Rotary(self.head_dim, base=rope_base)
         self.use_xsa = False  # Enabled selectively on deeper layers
+        self.use_diag_mask = False  # Diagonal masking (ternary-safe XSA alternative)
+        # Will be set via set_diag_mask() before torch.compile
+        self.register_buffer("diag_mask", None, persistent=False)
+
+    def set_diag_mask(self, seq_len: int, device: torch.device) -> None:
+        """Pre-build the causal+diagonal mask for torch.compile compatibility."""
+        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+        diag = torch.eye(seq_len, dtype=torch.bool, device=device)
+        diag[0, 0] = False  # Keep position 0's self-attention (no other context with causal)
+        self.diag_mask = causal & ~diag
 
     def _xsa(self, y: Tensor, v: Tensor) -> Tensor:
         """Exclusive Self Attention: subtract self-value projection (GQA-aware, zero-alloc).
@@ -566,14 +577,24 @@ class GQASelfAttention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if self.use_diag_mask:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=self.diag_mask,
+                is_causal=False,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        else:
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
         if self.use_xsa:
             y = self._xsa(y, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
@@ -965,7 +986,7 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8")
-    grad_accum_steps = 8 // world_size
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", 8 // world_size))
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1065,11 +1086,18 @@ def main() -> None:
     )
 
     # Enable XSA on the last N attention layers
+    attn_blocks = [b for b in base_model.blocks if isinstance(b.mixer, GQASelfAttention)]
     if args.xsa_last_n > 0:
-        attn_blocks = [b for b in base_model.blocks if isinstance(b.mixer, GQASelfAttention)]
         for b in attn_blocks[-args.xsa_last_n:]:
             b.mixer.use_xsa = True
         log0(f"xsa:enabled on last {min(args.xsa_last_n, len(attn_blocks))} of {len(attn_blocks)} attention layers")
+
+    # Enable diagonal masking on the last N attention layers (ternary-safe XSA alternative)
+    if args.diag_mask_last_n > 0:
+        for b in attn_blocks[-args.diag_mask_last_n:]:
+            b.mixer.use_diag_mask = True
+            b.mixer.set_diag_mask(args.train_seq_len, device)
+        log0(f"diag_mask:enabled on last {min(args.diag_mask_last_n, len(attn_blocks))} of {len(attn_blocks)} attention layers")
 
     # Keep QATLinear weights in fp32 for gradient quality
     for module in base_model.modules():
