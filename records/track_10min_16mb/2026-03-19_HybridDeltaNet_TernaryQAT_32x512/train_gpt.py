@@ -407,8 +407,6 @@ class QATLinear(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if self.apply_qat and QATLinear.qat_globally_enabled:
-            # SOTA Feb 2026: Zero-Centered QAT to prevent sparsity collapse
-            x = x - x.mean(dim=-1, keepdim=True)
             # During QAT (training or eval), always use the quantized weights.
             # TernaryQuantizeSTE.apply performs the "compress-uncompress" cycle.
             w_q = TernaryQuantizeSTE.apply(self.weight)
@@ -1403,6 +1401,7 @@ def main() -> None:
         current_recurrence = 2 if QATLinear.qat_globally_enabled else 1
         
         if QATLinear.qat_globally_enabled and not was_enabled:
+            torch._dynamo.reset() # SOTA March 2026: Clear graph for new depth
             log0(f"late_qat: enabling ternary QAT and switching to recurrence=2 at step {step} (progress={progress:.3f})")
 
         should_validate = last_step or (
