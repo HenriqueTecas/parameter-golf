@@ -850,28 +850,33 @@ class HybridGPT(nn.Module):
             x, v = self.blocks[i](x, x0, v_base)
             if v_base is None: v_base = v
 
+        @torch.compiler.disable()
+        def _run_recurrence(x: Tensor, x0: Tensor, v_base: Tensor | None, r_count: int) -> tuple[Tensor, Tensor | None]:
+            for r in range(r_count):
+                if r > 0:
+                    x = self.recurrence_norm(x)
+
+                # Encoder half of recurrent block: save skip connections
+                skip_connections: list[Tensor] = []
+                for i in range(self.rec_encoder_count):
+                    x, v = self.blocks[rec_start + i](x, x0, v_base)
+                    if v_base is None: v_base = v
+                    skip_connections.append(x)
+
+                # Decoder half of recurrent block: consume skip connections
+                for j in range(self.rec_decoder_count):
+                    block_idx = rec_start + self.rec_encoder_count + j
+                    if j < self.num_skip_weights:
+                        skip = skip_connections[self.num_skip_weights - 1 - j]
+                        sw = self.skip_weights[j].to(dtype=x.dtype)[None, None, :]
+                        x = x + sw * skip
+                    x, v = self.blocks[block_idx](x, x0, v_base)
+                    if v_base is None: v_base = v
+            return x, v_base
+
         # Recurrent layers (run dynamic or static count)
         r_count = num_recurrences if num_recurrences is not None else self.num_recurrences
-        for r in range(r_count):
-            if r > 0:
-                x = self.recurrence_norm(x)
-
-            # Encoder half of recurrent block: save skip connections
-            skip_connections: list[Tensor] = []
-            for i in range(self.rec_encoder_count):
-                x, v = self.blocks[rec_start + i](x, x0, v_base)
-                if v_base is None: v_base = v
-                skip_connections.append(x)
-
-            # Decoder half of recurrent block: consume skip connections
-            for j in range(self.rec_decoder_count):
-                block_idx = rec_start + self.rec_encoder_count + j
-                if j < self.num_skip_weights:
-                    skip = skip_connections[self.num_skip_weights - 1 - j]
-                    sw = self.skip_weights[j].to(dtype=x.dtype)[None, None, :]
-                    x = x + sw * skip
-                x, v = self.blocks[block_idx](x, x0, v_base)
-                if v_base is None: v_base = v
+        x, v_base = _run_recurrence(x, x0, v_base, r_count)
 
         # Exit layers (unique, run once)
         for i in range(exit_start, len(self.blocks)):
