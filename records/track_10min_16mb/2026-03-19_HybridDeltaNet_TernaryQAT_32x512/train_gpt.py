@@ -619,6 +619,9 @@ class GQASelfAttention(nn.Module):
             # Tie unused parameter to the compute graph for DDP without performance penalty
             v = v + 0.0 * self.v_resid_mix.to(v.dtype)
 
+        # Save v before GQA expansion for Value Residual passthrough
+        v_out = v
+
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
 
@@ -628,12 +631,13 @@ class GQASelfAttention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
+        # Expand KV heads for GQA compat
+        if self.num_kv_heads != self.num_heads:
+            group = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(group, dim=1)
+            v = v.repeat_interleave(group, dim=1)
+
         if self.use_diag_mask:
-            # Expand KV heads for GQA compat (Flash/mem_efficient don't support mask+GQA)
-            if self.num_kv_heads != self.num_heads:
-                group = self.num_heads // self.num_kv_heads
-                k = k.repeat_interleave(group, dim=1)
-                v = v.repeat_interleave(group, dim=1)
             y = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -642,10 +646,6 @@ class GQASelfAttention(nn.Module):
                 is_causal=False,
             )
         else:
-            if self.num_kv_heads != self.num_heads:
-                group = self.num_heads // self.num_kv_heads
-                k = k.repeat_interleave(group, dim=1)
-                v = v.repeat_interleave(group, dim=1)
             y = F.scaled_dot_product_attention(
                 q,
                 k,
@@ -656,7 +656,7 @@ class GQASelfAttention(nn.Module):
         if self.use_xsa:
             y = self._xsa(y, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.out_proj(y), v
+        return self.out_proj(y), v_out
 
 
 # -----------------------------
