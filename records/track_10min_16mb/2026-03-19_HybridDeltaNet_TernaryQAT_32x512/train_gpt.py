@@ -49,20 +49,20 @@ class Hyperparameters:
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
-    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
+    warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 6000))
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
-    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
 
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 12))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 704))
+    model_dim = int(os.environ.get("MODEL_DIM", 768))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
-    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 15.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -90,7 +90,7 @@ class Hyperparameters:
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
     diag_mask_last_n = int(os.environ.get("DIAG_MASK_LAST_N", 0))
-    late_qat_frac = float(os.environ.get("LATE_QAT_FRAC", 0.0))
+    late_qat_frac = float(os.environ.get("LATE_QAT_FRAC", 0.8))
 
 
 # -----------------------------
@@ -321,6 +321,45 @@ def eval_val(
 # TERNARY QUANTIZATION AWARE TRAINING
 # -----------------------------
 
+def base3_pack(w_ternary: Tensor) -> Tensor:
+    # w_ternary has values in {-1, 0, 1}
+    # Map to {0, 1, 2}
+    w = (w_ternary + 1).to(torch.uint8)
+    flat = w.flatten()
+    # Pad to multiple of 5
+    pad = (5 - (flat.numel() % 5)) % 5
+    if pad > 0:
+        flat = torch.cat([flat, torch.zeros(pad, dtype=torch.uint8, device=flat.device)])
+    
+    # Reshape to (N, 5)
+    groups = flat.view(-1, 5)
+    # Pack 5 base-3 values into one byte (max value 3^5-1 = 242)
+    packed = (groups[:, 0].to(torch.int32) + 
+              3 * groups[:, 1].to(torch.int32) + 
+              9 * groups[:, 2].to(torch.int32) + 
+              27 * groups[:, 3].to(torch.int32) + 
+              81 * groups[:, 4].to(torch.int32))
+    return packed.to(torch.uint8)
+
+def base3_unpack(packed: Tensor, shape: torch.Size, device: torch.device) -> Tensor:
+    numel = 1
+    for s in shape: numel *= s
+    
+    b = packed.to(torch.int32)
+    x0 = b % 3
+    b //= 3
+    x1 = b % 3
+    b //= 3
+    x2 = b % 3
+    b //= 3
+    x3 = b % 3
+    b //= 3
+    x4 = b % 3
+    
+    unpacked = torch.stack([x0, x1, x2, x3, x4], dim=1).flatten()
+    unpacked = unpacked[:numel].view(shape)
+    return (unpacked.float() - 1.0).to(device)
+
 
 class TernaryQuantizeSTE(torch.autograd.Function):
     @staticmethod
@@ -484,7 +523,7 @@ class GatedLinearAttention(nn.Module):
 
         out = (intra + inter).reshape(B, H, T, d)
         out = out.transpose(1, 2).contiguous().reshape(B, T, D)
-        return self.out_proj(out)
+        return self.out_proj(out), None
 
 
 # -----------------------------
@@ -528,6 +567,7 @@ class GQASelfAttention(nn.Module):
         self.use_diag_mask = False  # Diagonal masking (ternary-safe XSA alternative)
         # Will be set via set_diag_mask() before torch.compile
         self.register_buffer("diag_mask", None, persistent=False)
+        self.v_resid_mix = nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
     def set_diag_mask(self, seq_len: int, device: torch.device) -> None:
         """Pre-build the causal+diagonal mask for torch.compile compatibility."""
@@ -549,7 +589,7 @@ class GQASelfAttention(nn.Module):
         proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
         return (y_g - proj).reshape(B, H, T, D)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, v_base: Tensor | None = None) -> Tensor:
         bsz, seqlen, dim = x.shape
 
         q = (
@@ -567,6 +607,11 @@ class GQASelfAttention(nn.Module):
             .reshape(bsz, seqlen, self.num_kv_heads, self.head_dim)
             .transpose(1, 2)
         )
+
+        if v_base is not None:
+            # ResFormer style Value Residual: blend first layer's V into current
+            mix = torch.sigmoid(self.v_resid_mix).to(v.dtype)
+            v = (1.0 - mix) * v + mix * v_base
 
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
@@ -602,7 +647,7 @@ class GQASelfAttention(nn.Module):
         if self.use_xsa:
             y = self._xsa(y, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.out_proj(y)
+        return self.out_proj(y), v
 
 
 # -----------------------------
@@ -620,6 +665,27 @@ class MLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
+
+
+# -----------------------------
+# INPUT ENRICHMENT: BIGRAM HASH
+# -----------------------------
+
+
+class BigramHash(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int, model_dim: int):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.emb = nn.Embedding(2048, embed_dim)
+        self.proj = QATLinear(embed_dim, model_dim, apply_qat=True, zero_init=True)
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        # Consecutive token pairs hashed into 2048 buckets
+        # input_ids: [B, T]
+        ids_prev = torch.roll(input_ids, shifts=1, dims=1)
+        ids_prev[:, 0] = 0
+        bigram_ids = (ids_prev * self.vocab_size + input_ids) % 2048
+        return self.proj(self.emb(bigram_ids))
 
 
 # -----------------------------
@@ -642,6 +708,7 @@ class HybridBlock(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
+        self.is_attention = is_attention
 
         if is_attention:
             self.mixer = GQASelfAttention(
@@ -657,15 +724,20 @@ class HybridBlock(nn.Module):
             torch.stack((torch.ones(dim), torch.zeros(dim))).float()
         )
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, v_base: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.mixer(self.attn_norm(x))
+        
+        if self.is_attention:
+            attn_out, v = self.mixer(self.attn_norm(x), v_base)
+        else:
+            attn_out, v = self.mixer(self.attn_norm(x))
+            
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(
             self.mlp_norm(x)
         )
-        return x
+        return x, v
 
 
 # -----------------------------
@@ -692,6 +764,7 @@ class HybridGPT(nn.Module):
         num_exit_layers: int = 2,
     ):
         super().__init__()
+        self.vocab_size = vocab_size
         self.logit_softcap = logit_softcap
         self.tied_embed_init_std = tied_embed_init_std
         self.num_recurrences = num_recurrences
@@ -700,6 +773,12 @@ class HybridGPT(nn.Module):
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=tied_embed_init_std)
+
+        # PR #367: BigramHash for input enrichment
+        self.bigram_hash = BigramHash(vocab_size, 128, model_dim)
+        
+        # PR #367: SmearGate for cross-token blending
+        self.smear_gate = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
 
         # Recurrent block: layers between entry and exit
         num_recurrent_layers = num_layers - num_entry_layers - num_exit_layers
@@ -739,17 +818,31 @@ class HybridGPT(nn.Module):
         self, input_ids: Tensor, target_ids: Tensor | None = None
     ) -> Tensor:
         x = self.tok_emb(input_ids)
+        
+        # BigramHash addition
+        x = x + self.bigram_hash(input_ids)
+        
         x = F.rms_norm(x, (x.size(-1),))
+        
+        # SmearGate: learned blending with previous token
+        x_prev = torch.roll(x, shifts=1, dims=1)
+        x_prev[:, 0, :] = 0
+        g = torch.sigmoid(self.smear_gate).to(x.dtype)[None, None, :]
+        x = (1.0 - g) * x + g * x_prev
+        
         x0 = x
 
         entry_end = self.num_entry_layers
         rec_start = entry_end
         rec_end = rec_start + self.num_recurrent_layers
         exit_start = rec_end
+        
+        v_base = None
 
         # Entry layers (unique, run once)
         for i in range(entry_end):
-            x = self.blocks[i](x, x0)
+            x, v = self.blocks[i](x, x0, v_base)
+            if v_base is None: v_base = v
 
         # Recurrent layers (run num_recurrences times)
         for r in range(self.num_recurrences):
@@ -759,7 +852,8 @@ class HybridGPT(nn.Module):
             # Encoder half of recurrent block: save skip connections
             skip_connections: list[Tensor] = []
             for i in range(self.rec_encoder_count):
-                x = self.blocks[rec_start + i](x, x0)
+                x, v = self.blocks[rec_start + i](x, x0, v_base)
+                if v_base is None: v_base = v
                 skip_connections.append(x)
 
             # Decoder half of recurrent block: consume skip connections
@@ -769,11 +863,13 @@ class HybridGPT(nn.Module):
                     skip = skip_connections[self.num_skip_weights - 1 - j]
                     sw = self.skip_weights[j].to(dtype=x.dtype)[None, None, :]
                     x = x + sw * skip
-                x = self.blocks[block_idx](x, x0)
+                x, v = self.blocks[block_idx](x, x0, v_base)
+                if v_base is None: v_base = v
 
         # Exit layers (unique, run once)
         for i in range(exit_start, len(self.blocks)):
-            x = self.blocks[i](x, x0)
+            x, v = self.blocks[i](x, x0, v_base)
+            if v_base is None: v_base = v
 
         x = self.final_norm(x)
         logits = F.linear(x, self.tok_emb.weight)
@@ -867,6 +963,8 @@ CONTROL_TENSOR_NAMES = (
     "mlp_scale",
     "resid_mix",
     "skip_weights",
+    "smear_gate",
+    "v_resid_mix",
 )
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_CLIP_Q = 0.9999984
@@ -875,6 +973,8 @@ INT8_CLIP_Q = 0.9999984
 def quantize_to_ternary(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
     scale = t32.abs().mean().clamp(min=1e-5)
+    # fp16 scale simulation
+    scale = scale.half().float()
     threshold = 0.5 * scale
     w_ternary = torch.where(
         t32 > threshold,
@@ -935,13 +1035,15 @@ def serialize_model(model: nn.Module, code: str) -> dict:
             float_weights[name] = t.to(torch.float16)
         elif is_ternary_target:
             w_q, scale = quantize_to_ternary(t)
-            ternary_weights[name] = {"w": w_q, "s": scale}
+            # PR #367: Base-3 packing for ~1.6 bits/param
+            w_packed = base3_pack(w_q)
+            ternary_weights[name] = {"w": w_packed, "s": scale, "shape": t.shape}
         else:
             q, s = quantize_float_tensor_int8(t)
             int8_weights[name] = {"q": q, "s": s}
 
     return {
-        "format": "hybrid_ternary_v2",
+        "format": "hybrid_ternary_base3_v1",
         "ternary": ternary_weights,
         "int8": int8_weights,
         "float": float_weights,
@@ -953,7 +1055,9 @@ def deserialize_model(obj: dict, model: nn.Module) -> None:
     state_dict = {}
 
     for name, data in obj["ternary"].items():
-        w = data["w"].float() * data["s"].float()
+        # PR #367: Base-3 unpacking
+        w_ternary = base3_unpack(data["w"], data["shape"], torch.device("cpu"))
+        w = w_ternary * data["s"].float()
         state_dict[name] = w
 
     for name, data in obj["int8"].items():
@@ -1108,12 +1212,13 @@ def main() -> None:
         if isinstance(module, QATLinear):
             module.weight.data = module.weight.data.float()
 
-    # Keep control/scalar parameters in fp32
+    # Restore BigramHash and control/scalar parameters to fp32
     with torch.no_grad():
         for name, param in base_model.named_parameters():
             if (
                 param.ndim < 2
                 or any(p in name for p in CONTROL_TENSOR_NAMES)
+                or "bigram_hash" in name
             ) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
@@ -1127,17 +1232,20 @@ def main() -> None:
 
     # Optimizer parameter grouping
     block_named_params = list(base_model.blocks.named_parameters())
+    bigram_named_params = list(base_model.bigram_hash.named_parameters())
+    all_named_params = block_named_params + bigram_named_params
+    
     matrix_params = [
         p
-        for name, p in block_named_params
+        for name, p in all_named_params
         if p.ndim == 2 and not any(pn in name for pn in CONTROL_TENSOR_NAMES)
     ]
-    block_scalar_params = [
+    scalar_params = [
         p
-        for name, p in block_named_params
+        for name, p in all_named_params
         if p.ndim < 2 or any(pn in name for pn in CONTROL_TENSOR_NAMES)
     ]
-    scalar_params = block_scalar_params + [base_model.skip_weights]
+    scalar_params += [base_model.skip_weights, base_model.smear_gate]
 
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": args.tied_embed_lr, "base_lr": args.tied_embed_lr}],
