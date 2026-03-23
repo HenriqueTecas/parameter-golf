@@ -58,7 +58,7 @@ class Hyperparameters:
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 12))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
-    model_dim = int(os.environ.get("MODEL_DIM", 512))
+    model_dim = int(os.environ.get("MODEL_DIM", 640))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 3))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -84,7 +84,7 @@ class Hyperparameters:
 
     chunk_size = int(os.environ.get("CHUNK_SIZE", 64))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    num_recurrences = int(os.environ.get("NUM_RECURRENCES", 2))
+    num_recurrences = int(os.environ.get("NUM_RECURRENCES", 1))
     num_entry_layers = int(os.environ.get("NUM_ENTRY_LAYERS", 2))
     num_exit_layers = int(os.environ.get("NUM_EXIT_LAYERS", 2))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
