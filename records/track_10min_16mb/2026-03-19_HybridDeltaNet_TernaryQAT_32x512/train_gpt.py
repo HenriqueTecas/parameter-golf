@@ -1406,14 +1406,13 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         progress = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
         
-        # SOTA 2026: Elastic Recurrence switch (recurrence 1 -> 2)
         # SOTA 2026: Late QAT switch (FP32 -> Ternary)
         was_enabled = QATLinear.qat_globally_enabled
         QATLinear.qat_globally_enabled = progress >= (1.0 - args.late_qat_frac)
-        current_recurrence = 2 if QATLinear.qat_globally_enabled else 1
-        
+        current_recurrence = args.num_recurrences  # Always train with full recurrence
+
         if QATLinear.qat_globally_enabled and not was_enabled:
-            log0(f"late_qat: enabling ternary QAT and switching to recurrence=2 at step {step} (progress={progress:.3f})")
+            log0(f"late_qat: enabling ternary QAT at step {step} (progress={progress:.3f})")
 
         should_validate = last_step or (
             args.val_loss_every > 0 and step % args.val_loss_every == 0
