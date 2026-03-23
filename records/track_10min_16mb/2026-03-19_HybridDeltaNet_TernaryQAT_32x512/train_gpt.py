@@ -631,29 +631,21 @@ class GQASelfAttention(nn.Module):
 
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
 
+        # Expand KV heads for GQA (works on all PyTorch versions)
+        if self.num_kv_heads != self.num_heads:
+            group = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(group, dim=1)
+            v_expanded = v.repeat_interleave(group, dim=1)
+        else:
+            v_expanded = v
+
         if self.use_diag_mask:
-            # Expand KV heads manually (Flash/mem_efficient don't support mask+GQA)
-            if self.num_kv_heads != self.num_heads:
-                group = self.num_heads // self.num_kv_heads
-                k = k.repeat_interleave(group, dim=1)
-                v_attn = v.repeat_interleave(group, dim=1)
-            else:
-                v_attn = v
             y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v_attn,
-                attn_mask=self.diag_mask,
-                is_causal=False,
+                q, k, v_expanded, attn_mask=self.diag_mask, is_causal=False,
             )
         else:
             y = F.scaled_dot_product_attention(
-                q,
-                k,
-                v,
-                attn_mask=None,
-                is_causal=True,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
+                q, k, v_expanded, attn_mask=None, is_causal=True,
             )
         if self.use_xsa:
             y = self._xsa(y, v)
