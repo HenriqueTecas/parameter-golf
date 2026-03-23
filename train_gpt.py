@@ -591,14 +591,12 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        # GQA: expand KV heads to match Q heads for PyTorch < 2.5 compat
+        if self.num_kv_heads != self.num_heads:
+            reps = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(reps, dim=1)
+            v = v.repeat_interleave(reps, dim=1)
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -733,7 +731,9 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    use_compile = os.environ.get("TORCH_COMPILE", "1") != "0"
+    if use_compile:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -754,7 +754,7 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
     if distributed:
-        dist.init_process_group(backend="nccl", device_id=device)
+        dist.init_process_group(backend="nccl")
         dist.barrier()
     master_process = rank == 0
 
@@ -840,7 +840,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
