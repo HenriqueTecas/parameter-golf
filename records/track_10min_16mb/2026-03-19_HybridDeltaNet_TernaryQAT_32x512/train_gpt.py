@@ -84,7 +84,7 @@ class Hyperparameters:
 
     chunk_size = int(os.environ.get("CHUNK_SIZE", 64))
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "1")))
-    num_recurrences = int(os.environ.get("NUM_RECURRENCES", 1))
+    num_recurrences = int(os.environ.get("NUM_RECURRENCES", 2))
     num_entry_layers = int(os.environ.get("NUM_ENTRY_LAYERS", 2))
     num_exit_layers = int(os.environ.get("NUM_EXIT_LAYERS", 2))
     muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.0))
@@ -1225,7 +1225,12 @@ def main() -> None:
     use_compile = bool(int(os.environ.get("TORCH_COMPILE", "1")))
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
     model: nn.Module = (
-        DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False)
+        DDP(
+            compiled_model,
+            device_ids=[local_rank],
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
         if distributed
         else compiled_model
     )
