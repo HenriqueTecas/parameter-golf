@@ -642,13 +642,16 @@ class GQASelfAttention(nn.Module):
                 is_causal=False,
             )
         else:
+            if self.num_kv_heads != self.num_heads:
+                group = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(group, dim=1)
+                v = v.repeat_interleave(group, dim=1)
             y = F.scaled_dot_product_attention(
                 q,
                 k,
                 v,
                 attn_mask=None,
                 is_causal=True,
-                enable_gqa=(self.num_kv_heads != self.num_heads),
             )
         if self.use_xsa:
             y = self._xsa(y, v)
